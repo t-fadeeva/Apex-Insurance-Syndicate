@@ -1,0 +1,202 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+contract ApexInsuranceSyndicate {
+    enum PolicyStatus { Active, Settled, Canceled }
+
+    struct Policy {
+        address payable holder;
+        uint256 insuredSum;
+        uint256 premiumPaid;
+        uint256 expiresAt;
+        PolicyStatus status;
+        bytes32 categoryKey;
+    }
+
+    address payable public immutable syndicateMaster;
+    string public syndicateTag;
+    uint256 public premiumFeeBps; // 200 = 2%
+    uint256 public policyCounter;
+    uint256 public totalReserveLiquidity;
+    uint256 public accumulatedFees;
+    bool public isProtocolPaused;
+
+    mapping(bytes32 => bool) public activeCategories;
+    mapping(uint256 => Policy) public policies;
+
+    event CategoryAdded(bytes32 indexed categoryKey);
+    event FeeRateModified(uint256 newFeeBps);
+    event PolicyCanceled(uint256 indexed policyId, uint256 refundAmount);
+    event PayoutSettled(uint256 indexed policyId, uint256 payoutAmount);
+    event ReserveDeposited(address indexed funder, uint256 amount);
+    event ReservesDrained(address indexed master, uint256 amount);
+    event PolicyDurationExtended(uint256 indexed policyId, uint256 newExpiry);
+    event FeesHarvested(address indexed master, uint256 amount);
+    event PolicyCreated(uint256 indexed policyId, address indexed holder, uint256 coverage);
+    event ProtocolPauseToggled(bool isPaused);
+    event SyndicateTagUpdated(string newTag);
+
+    modifier onlyMaster() {
+        require(msg.sender == syndicateMaster, "ApexSyndicate: Access denied");
+        _;
+    }
+
+    modifier whenNotPaused() {
+        require(!isProtocolPaused, "ApexSyndicate: Protocol paused");
+        _;
+    }
+
+    constructor() {
+        syndicateMaster = payable(msg.sender);
+        syndicateTag = "Apex Base Decentralized Insurance Syndicate v1";
+        premiumFeeBps = 200; // 2%
+        isProtocolPaused = false;
+        activeCategories[0x424153455f444546495f534d4152545f434f4e54524143540000000000000000] = true;
+    }
+
+    // 1. addRiskCategory
+    function addRiskCategory(bytes32 categoryKey) external onlyMaster {
+        require(!activeCategories[categoryKey], "ApexSyndicate: Category already added");
+        activeCategories[categoryKey] = true;
+        emit CategoryAdded(categoryKey);
+    }
+
+    // 2. adjustFeeRate
+    function adjustFeeRate(uint256 newFeeBps) external onlyMaster {
+        require(newFeeBps <= 1000, "ApexSyndicate: Max fee 10%");
+        premiumFeeBps = newFeeBps;
+        emit FeeRateModified(newFeeBps);
+    }
+
+    // 3. cancelInsurancePolicy
+    function cancelInsurancePolicy(uint256 policyId) external {
+        Policy storage p = policies[policyId];
+        require(policyId > 0 && policyId <= policyCounter, "ApexSyndicate: Invalid ID");
+        require(p.holder == msg.sender || msg.sender == syndicateMaster, "ApexSyndicate: Unauthorized");
+        require(p.status == PolicyStatus.Active, "ApexSyndicate: Not active");
+
+        p.status = PolicyStatus.Canceled;
+        uint256 refund = p.insuredSum;
+        p.insuredSum = 0;
+        totalReserveLiquidity -= refund;
+
+        (bool sent, ) = p.holder.call{value: refund}("");
+        require(sent, "ApexSyndicate: Refund failed");
+
+        emit PolicyCanceled(policyId, refund);
+    }
+
+    // 4. claimInsurancePayout
+    function claimInsurancePayout(uint256 policyId, uint256 payoutAmount) external onlyMaster {
+        Policy storage p = policies[policyId];
+        require(policyId > 0 && policyId <= policyCounter, "ApexSyndicate: Invalid ID");
+        require(p.status == PolicyStatus.Active, "ApexSyndicate: Not active");
+        require(payoutAmount <= p.insuredSum && payoutAmount > 0, "ApexSyndicate: Invalid payout");
+
+        p.status = PolicyStatus.Settled;
+        p.insuredSum -= payoutAmount;
+        totalReserveLiquidity -= payoutAmount;
+
+        (bool sent, ) = p.holder.call{value: payoutAmount}("");
+        require(sent, "ApexSyndicate: Payout failed");
+
+        emit PayoutSettled(policyId, payoutAmount);
+    }
+
+    // 5. depositReserveCapital
+    function depositReserveCapital() external payable onlyMaster {
+        require(msg.value > 0, "ApexSyndicate: Zero deposit");
+        totalReserveLiquidity += msg.value;
+        emit ReserveDeposited(msg.sender, msg.value);
+    }
+
+    // 6. drainEmergencyReserves
+    function drainEmergencyReserves() external onlyMaster {
+        uint256 surplus = address(this).balance > totalReserveLiquidity ? address(this).balance - totalReserveLiquidity : 0;
+        if (surplus == 0 && address(this).balance > 0 && policyCounter == 0) {
+            surplus = address(this).balance;
+        }
+        require(surplus > 0, "ApexSyndicate: Zero surplus");
+
+        (bool sent, ) = syndicateMaster.call{value: surplus}("");
+        require(sent, "ApexSyndicate: Sweep failed");
+
+        emit ReservesDrained(syndicateMaster, surplus);
+    }
+
+    // 7. extendPolicyDuration
+    function extendPolicyDuration(uint256 policyId, uint256 extraSeconds) external whenNotPaused {
+        Policy storage p = policies[policyId];
+        require(policyId > 0 && policyId <= policyCounter, "ApexSyndicate: Invalid ID");
+        require(p.holder == msg.sender || msg.sender == syndicateMaster, "ApexSyndicate: Unauthorized");
+        require(p.status == PolicyStatus.Active, "ApexSyndicate: Not active");
+        require(extraSeconds > 0, "ApexSyndicate: Zero extra time");
+
+        p.expiresAt += extraSeconds;
+        emit PolicyDurationExtended(policyId, p.expiresAt);
+    }
+
+    // 8. harvestPlatformFees
+    function harvestPlatformFees() external onlyMaster {
+        uint256 fees = accumulatedFees;
+        require(fees > 0, "ApexSyndicate: Zero fees");
+
+        accumulatedFees = 0;
+        (bool sent, ) = syndicateMaster.call{value: fees}("");
+        require(sent, "ApexSyndicate: Harvest failed");
+
+        emit FeesHarvested(syndicateMaster, fees);
+    }
+
+    // 9. issueInsurancePolicy
+    function issueInsurancePolicy(
+        bytes32 categoryKey,
+        uint256 durationSeconds
+    ) external payable whenNotPaused returns (uint256) {
+        require(msg.value > 0, "ApexSyndicate: Premium required");
+        require(durationSeconds >= 60, "ApexSyndicate: Min 60 seconds");
+
+        uint256 fee = (msg.value * premiumFeeBps) / 10000;
+        uint256 netCover = msg.value - fee;
+        accumulatedFees += fee;
+
+        policyCounter++;
+        policies[policyCounter] = Policy({
+            holder: payable(msg.sender),
+            insuredSum: netCover,
+            premiumPaid: fee,
+            expiresAt: block.timestamp + durationSeconds,
+            status: PolicyStatus.Active,
+            categoryKey: categoryKey
+        });
+
+        totalReserveLiquidity += netCover;
+        emit PolicyCreated(policyCounter, msg.sender, netCover);
+        return policyCounter;
+    }
+
+    // 10. toggleProtocolPause
+    function toggleProtocolPause(bool isPaused) external onlyMaster {
+        isProtocolPaused = isPaused;
+        emit ProtocolPauseToggled(isPaused);
+    }
+
+    // 11. updateSyndicateTag
+    function updateSyndicateTag(string calldata newTag) external onlyMaster {
+        require(bytes(newTag).length > 0, "ApexSyndicate: Empty string");
+        syndicateTag = newTag;
+        emit SyndicateTagUpdated(newTag);
+    }
+
+    // Read-метод
+    function getPolicyInfo(uint256 policyId) external view returns (
+        address holder,
+        uint256 insuredSum,
+        uint256 premiumPaid,
+        uint256 expiresAt,
+        PolicyStatus status
+    ) {
+        Policy memory p = policies[policyId];
+        return (p.holder, p.insuredSum, p.premiumPaid, p.expiresAt, p.status);
+    }
+}
